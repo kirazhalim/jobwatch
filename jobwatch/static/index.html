@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jobwatch</title>
+<style>
+:root {
+  --bg: #0e1013; --win: #15181c; --bar: #1c2025; --line: #2a2f36;
+  --text: #d8dce1; --dim: #7c8590; --accent: #8fb4d8; --warn: #e5736a;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.6 var(--mono); }
+.win { max-width: 1000px; margin: 18px auto 40px; background: var(--win); border: 1px solid var(--line);
+  border-radius: 8px; overflow: hidden; }
+.titlebar { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 12px;
+  padding: 7px 14px; background: var(--bar); border-bottom: 1px solid var(--line); color: var(--dim); font-size: 12px; }
+.screen { padding: 12px 16px 20px; }
+.dim { color: var(--dim); }
+.warn { color: var(--warn); }
+.bar-on { color: var(--accent); }
+.job { border-top: 1px solid var(--line); padding: 10px 0; margin-top: 10px; }
+.head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0 12px; margin-bottom: 2px; }
+.alias { font-weight: 700; color: #fff; overflow-wrap: anywhere; }
+.alias .sub { font-weight: 400; color: var(--dim); font-size: 12px; padding-left: 2ch; }
+.row { display: grid; grid-template-columns: 9ch 1fr; gap: 0 1ch; }
+.row > .k { color: var(--dim); }
+.row > .v { min-width: 0; overflow-wrap: anywhere; }
+.section { display: flex; align-items: center; gap: 8px; margin-top: 22px; padding: 6px 10px;
+  background: var(--bar); border: 1px solid var(--line); border-radius: 4px;
+  color: #fff; font-weight: 700; cursor: pointer; user-select: none; }
+.section:hover { border-color: var(--dim); }
+.section .count { color: var(--dim); font-weight: 400; }
+.section .arrow { color: var(--dim); width: 1ch; }
+.link { cursor: pointer; user-select: none; text-decoration: underline; text-decoration-color: var(--line); }
+.link:hover { color: #fff; }
+pre.log { margin: 6px 0 2px; padding: 8px 10px; background: #0a0b0d; border: 1px solid var(--line);
+  border-radius: 4px; height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-all; font: 12px/1.5 var(--mono); }
+@media (max-width: 640px) {
+  .win { margin: 0; border-radius: 0; border-left: 0; border-right: 0; }
+  .row { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="win">
+  <div class="titlebar">
+    <span>jobwatch<span id="mode"></span></span>
+    <label><input type="checkbox" id="hideSmall" checked> hide jobs under 100 MB</label>
+  </div>
+  <div class="screen" id="screen">Loading…</div>
+</div>
+<script>
+const SMALL = 100 * 1024 ** 2;
+const STALE_SECONDS = 600;
+const BAR = 20;
+const openLogs = new Set();
+const logs = {};
+let state = null;
+let collapsed = new Set();
+try { collapsed = new Set(JSON.parse(localStorage.getItem('jw.collapsed') || '[]')); } catch {}
+
+const hideSmall = document.getElementById('hideSmall');
+try { hideSmall.checked = localStorage.getItem('jw.hideSmall') !== '0'; } catch {}
+hideSmall.onchange = () => { try { localStorage.setItem('jw.hideSmall', hideSmall.checked ? '1' : '0'); } catch {} render(); };
+
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const gib = b => (b / 1024 ** 3).toFixed(1) + ' GiB';
+const size = b => b >= 1024 ** 3 ? gib(b) : (b / 1024 ** 2).toFixed(0) + ' MB';
+const base = p => p ? p.replace(/\/+$/, '').split('/').pop() : '';
+function dur(s) {
+  s = Math.max(0, Math.round(s));
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${String(m).padStart(2, '0')}m`;
+  return `${m}m ${String(s % 60).padStart(2, '0')}s`;
+}
+function bar(frac) {
+  const n = Math.round(Math.max(0, Math.min(1, frac)) * BAR);
+  return `[<span class="bar-on">${'█'.repeat(n)}</span><span class="dim">${'░'.repeat(BAR - n)}</span>]`;
+}
+const row = (k, v) => `<div class="row"><span class="k">${k}</span><span class="v">${v}</span></div>`;
+
+function endStatus(j) {
+  if (j.exit_code == null) return '<span class="dim">ended</span>';
+  return j.exit_code === 0 ? '<span class="dim">ok</span>' : `<span class="warn">failed (exit ${j.exit_code})</span>`;
+}
+
+function job(j, now, ended) {
+  const ncpu = state.ncpu || 1, total = state.memory.total;
+  const logAge = j.log_mtime ? now - j.log_mtime : null;
+  const runFor = (ended ? j.ended : now) - j.started;
+  const out = [];
+
+  const info = j.info || {};
+  const title = info.desc || info.alias || j.name;
+  const sub = [info.desc ? info.alias : null, info.note].filter(Boolean).join(' · ');
+  out.push(`<div class="head"><span class="alias">${ended ? '○' : '●'} ${esc(title)}`
+    + `${sub ? `<br><span class="sub">${esc(sub)}</span>` : ''}</span>`
+    + `<span>${ended ? endStatus(j) + ' · ' : ''}<span class="dim">pid ${j.pid ?? '–'}</span></span></div>`);
+
+  const p = j.progress;
+  out.push(row('progress', p
+    ? `${bar(p.pct)} ${Math.round(p.pct * 100)}% <span class="dim">${esc(p.label)}${p.eta != null ? ` · ~${dur(p.eta)} left` : ''}</span>`
+    : '<span class="dim">unknown</span>'));
+
+  const heavy = !ended && j.rss > state.heavy_bytes ? ' <span class="warn">heavy</span>' : '';
+  const o = j.overall;
+  if (o && !ended) out.push(row('overall',
+    `${bar(o.pct)} ${Math.round(o.pct * 100)}% <span class="dim">${esc(o.label)}${o.eta != null ? ` · ~${dur(o.eta)} left` : ''}</span>`));
+
+  if (j.rss != null) out.push(row('memory', `${bar(j.rss / total)} ${size(j.rss)} <span class="dim">peak ${size(j.peak)}</span>${heavy}`));
+
+  if (!ended) out.push(row('cpu',
+    `${bar(j.cpu / (ncpu * 100))} ${(j.cpu / 100).toFixed(1)} of ${ncpu} cores <span class="dim">(${Math.round(j.cpu)}%)</span>`));
+
+  const stale = !ended && logAge !== null && logAge > STALE_SECONDS;
+  out.push(row('time', `${ended ? 'ran for' : 'running'} ${dur(runFor)}`
+    + (logAge !== null ? ` <span class="${stale ? 'warn' : 'dim'}">· last log line ${dur(logAge)} ago</span>` : '')));
+
+  const logFile = j.stdout || j.stderr;
+  out.push(row('log', (logFile
+    ? `<span class="link" data-pid="${j.pid}">${openLogs.has(j.pid) ? 'hide' : 'show'}</span> `
+    : '<span class="dim">no log file</span> ')
+    + `<span class="dim">${esc(j.name)} · ${esc(base(j.cwd))}</span>`));
+  if (openLogs.has(j.pid)) {
+    const l = logs[j.pid];
+    out.push(`<pre class="log" data-pid="${j.pid}">${!l ? 'Loading…' : l.error ? esc(l.error) : esc(l.lines.join('\n'))}</pre>`);
+  }
+  return `<div class="job" title="${esc(j.cmd)}">${out.join('')}</div>`;
+}
+
+function render() {
+  if (!state) return;
+  const scroll = {};
+  document.querySelectorAll('pre.log').forEach(pre => {
+    scroll[pre.dataset.pid] = { top: pre.scrollTop, bottom: pre.scrollHeight - pre.scrollTop - pre.clientHeight < 8 };
+  });
+  const m = state.memory, now = state.now;
+  // With --tracked-only (for example the demo), every job on the page is one you started.
+  const jobs = state.jobs.filter(j => state.tracked_only || !hideSmall.checked || j.rss >= SMALL);
+  hideSmall.parentElement.style.display = state.tracked_only ? 'none' : '';
+  const heavy = state.jobs.filter(j => j.rss > state.heavy_bytes).length;
+
+  let html = row('mac', `${bar(m.used / m.total)} ${gib(m.used)} of ${gib(m.total)} used`
+    + (heavy > 1 ? ` <span class="warn">· ${heavy} heavy jobs run</span>` : ''));
+  html += section('running', 'RUNNING', jobs.length);
+  if (!collapsed.has('running'))
+    html += jobs.length ? jobs.map(j => job(j, now, false)).join('') : `<div class="dim" style="margin-top:8px">${state.tracked_only ? 'No job from <code>jobwatch run</code> runs now.' : 'No Python job runs now.'}</div>`;
+  if (state.ended.length) {
+    html += section('ended', 'ENDED', state.ended.length);
+    if (!collapsed.has('ended')) html += state.ended.map(j => job(j, now, true)).join('');
+  }
+  document.getElementById('screen').innerHTML = html;
+  document.getElementById('mode').textContent = state.tracked_only ? ' · only jobs from jobwatch run' : '';
+
+  document.querySelectorAll('pre.log').forEach(pre => {
+    const st = scroll[pre.dataset.pid];
+    pre.scrollTop = !st || st.bottom ? pre.scrollHeight : st.top;
+  });
+}
+
+function section(key, title, n) {
+  return `<div class="section" data-section="${key}"><span class="arrow">${collapsed.has(key) ? '▸' : '▾'}</span>`
+    + `${title} <span class="count">(${n})</span></div>`;
+}
+
+async function refresh() {
+  try {
+    state = await (await fetch('/api/state')).json();
+    await Promise.all([...openLogs].map(async pid => {
+      try {
+        const r = await (await fetch(`/api/log?pid=${pid}&lines=400`)).json();
+        logs[pid] = r.error ? { error: r.error, lines: [] } : r;
+      } catch (e) { logs[pid] = { error: String(e), lines: [] }; }
+    }));
+    render();
+  } catch (e) {
+    document.getElementById('screen').innerHTML = '<span class="warn">Cannot reach the jobwatch server.</span>';
+  }
+}
+
+document.addEventListener('click', e => {
+  const sec = e.target.closest('.section[data-section]');
+  if (sec) {
+    const key = sec.dataset.section;
+    collapsed.has(key) ? collapsed.delete(key) : collapsed.add(key);
+    try { localStorage.setItem('jw.collapsed', JSON.stringify([...collapsed])); } catch {}
+    return render();
+  }
+  const link = e.target.closest('.link[data-pid]');
+  if (!link) return;
+  const pid = +link.dataset.pid;
+  openLogs.has(pid) ? openLogs.delete(pid) : openLogs.add(pid);
+  refresh();
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
